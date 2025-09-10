@@ -115,7 +115,7 @@ MPI_SERIAL_TIME="" # Initialize baseline time for this block
 
 for mpi in "${MPI_LIST[@]}"; do
     # For pure MPI, each task uses 1 CPU core
-    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=cores --cpus-per-task=1 ./stencil_parallel_nomp -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
+    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=ldom --cpus-per-task=1 ./stencil_parallel_nomp -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
 
     MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
     MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
@@ -190,7 +190,7 @@ HYBRID_SERIAL_TIME="" # Initialize baseline time for this block
 for mpi in "${MPI_LIST[@]}"; do
     export OMP_NUM_THREADS=8   
 
-    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=cores --cpus-per-task=8 ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
+    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=ldom --cpus-per-task=8 ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
 
     MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
     MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
@@ -266,7 +266,7 @@ HYBRID_V2_SERIAL_TIME="" # Initialize baseline time for this block
 for mpi in "${MPI_LIST[@]}"; do
     export OMP_NUM_THREADS=8
 
-    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=cores --cpus-per-task=8 ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
+    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=ldom --cpus-per-task=8 ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n "$ITERATIONS" -e "$NSOURCES" -E "$ENERGY_PER_SOURCE" $PERIODIC_FLAG)
 
     MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
     MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
