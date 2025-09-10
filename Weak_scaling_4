@@ -59,6 +59,7 @@ echo "---------------------------------------------------"
 #export OMP_PLACES=cores
 #export OMP_PROC_BIND=close
 
+OMP_SERIAL_TIME=""
 for threads in "${THREADS_LIST[@]}"; do
     # Scale side length by sqrt(threads) to keep area proportional to threads
     NEW_SIDE=$(echo "sqrt($threads) * $BASE_SIDE_LEN" | bc -l)
@@ -118,6 +119,7 @@ echo "---------------------------------------------------"
 echo "Benchmarking PARALLEL version (MPI Only)"
 echo "---------------------------------------------------"
 
+MPI_SERIAL_TIM=""
 for mpi in "${MPI_LIST_PURE[@]}"; do
     # Scale side length by sqrt(total_cores) to keep area proportional
     NEW_SIDE=$(echo "sqrt($mpi) * $BASE_SIDE_LEN" | bc -l)
