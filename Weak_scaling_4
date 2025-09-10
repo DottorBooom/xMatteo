@@ -1,0 +1,348 @@
+#!/bin/bash
+
+#SBATCH --partition=dcgp_usr_prod
+#SBATCH -A 
+#SBATCH --job-name=weak_scaling_test
+#SBATCH --output=weak_scaling_4.out
+#SBATCH --error=weak_scaling_4.err
+#SBATCH --nodes=4
+#SBATCH --exclusive
+#SBATCH --time=00:10:00
+
+module load openMPI/4.1.6
+
+# --- Weak Scaling Test Configuration ---
+# In weak scaling, the work per processing element is kept constant.
+# The total problem size grows proportionally with the number of processors.
+# The goal is to keep the execution time constant.
+RESULTS_DIR="results_leonardo/weak_scaling"
+OMP_CSV="$RESULTS_DIR/weak_omp_4.csv"
+MPI_PURE_CSV="$RESULTS_DIR/weak_mpi_4.csv"
+MPI_HYBRID_CSV="$RESULTS_DIR/weak_hybrid_4.csv"
+MPI_HYBRID_V2_CSV="$RESULTS_DIR/weak_hybrid_v2_4.csv"
+
+# Parameters
+# Define a base side length for the square grid of a single core.
+BASE_SIDE_LEN=$((2048)) # 2048
+ITERATIONS=1000
+NSOURCES=1000
+ENERGY_PER_SOURCE=1.0
+
+# Processing elements to test
+THREADS_LIST=(336 448) # Number of OpenMP threads for pure OpenMP runs
+MPI_LIST=(42 56) # Number of MPI tasks for hybrid runs
+MPI_LIST_PURE=(42 56) # Number of MPI tasks for pure MPI runs
+OMP_THREADS_PER_TASK=8 # Number of OpenMP threads per MPI task in hybrid runs
+
+# --- Prepare results directory ---
+mkdir -p $RESULTS_DIR
+# Create CSV headers. Note: "Efficiency" is the key metric here.
+echo "Threads,ProblemSize,TotalTime,InitTime,ComputeTime,Overhead,Efficiency,LoadImbalance" > "$OMP_CSV"
+echo "Tasks,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_PURE_CSV"
+echo "Tasks,ThreadsPerTask,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_HYBRID_CSV"
+echo "Tasks,ThreadsPerTask,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_HYBRID_V2_CSV"
+
+PERIODIC_FLAG="-p 1"
+
+echo "Rebuilding executables..."
+make clean > /dev/null
+make all > /dev/null
+
+if [ ! -f "stencil_serial_nomp" ] || [ ! -f "stencil_serial" ] || [ ! -f "stencil_parallel" ] || [ ! -f "stencil_parallel_2" ]; then
+    echo "ERROR: Compilation failed. One or more executables were not created."
+    exit 1
+fi
+
+echo "---------------------------------------------------"
+echo "Benchmarking PARALLEL version (OpenMP)"
+echo "---------------------------------------------------"
+#export OMP_PLACES=cores
+#export OMP_PROC_BIND=close
+
+for threads in "${THREADS_LIST[@]}"; do
+    # Scale side length by sqrt(threads) to keep area proportional to threads
+    NEW_SIDE=$(echo "sqrt($threads) * $BASE_SIDE_LEN" | bc -l)
+    X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+    Y_SIZE=$X_SIZE
+    PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+    echo "Testing OpenMP with $threads threads on a $PROBLEM_SIZE grid..."
+
+    # Set the number of threads for this specific run
+    export OMP_NUM_THREADS="$threads"
+
+    # CORRECTED COMMAND: Removed --cpu-bind and rely on OpenMP environment variables
+    PAR_OUTPUT=$(srun --ntasks=1 --cpus-per-task="$threads" ./stencil_serial -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+    
+    OMP_TOTAL=$(echo "$PAR_OUTPUT"   | awk '/^Total time:/ {print $3}')
+    OMP_INIT=$(echo "$PAR_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+    OMP_COMP=$(echo "$PAR_OUTPUT" | awk '/^Computation time:/ {print $3}')
+    OMP_COMP_RATIO=$(echo "$PAR_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+    OMP_OVER_S=$(echo "$PAR_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+    OMP_OVER_PCT=$(echo "$PAR_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+    LOAD_IMBALANCE=$(echo "$PAR_OUTPUT" | awk '/Load imbalance/ {print $3}')
+
+    if [[ -z "${OMP_TOTAL:-}" || -z "${OMP_INIT:-}" || -z "${OMP_COMP:-}" || -z "${OMP_COMP_RATIO:-}" || -z "${OMP_OVER_S:-}" || -z "${OMP_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" ]]; then
+        echo "Error: OpenMP run did not produce valid times for $threads thread(s)." >&2
+        echo "$PAR_OUTPUT"
+        continue
+    fi
+
+    # If it's the first run (1 thread), capture the baseline time
+    if [ "$threads" -eq 1 ]; then
+        OMP_SERIAL_TIME=$OMP_TOTAL
+        echo "Baseline time for OpenMP (1 thread): $OMP_SERIAL_TIME s"
+    fi
+
+    # Weak scaling efficiency = Time(1 core) / Time(N cores)
+    EFFICIENCY=$(echo "scale=4; $OMP_SERIAL_TIME / $OMP_TOTAL" | bc)
+
+    echo "Threads: $threads"
+    echo "  Init:      $OMP_INIT s"
+    echo "  Compute:   $OMP_COMP s ($OMP_COMP_RATIO %)"
+    echo "  Overhead:  $OMP_OVER_S s (${OMP_OVER_PCT:-N/A} %)"
+    echo "  Total:     $OMP_TOTAL s"
+    echo "Parallel (OpenMP) performance:"
+    echo "  Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc) %"
+    echo "  Load imbalance: $LOAD_IMBALANCE"
+    echo "---------------------------------------------------"
+
+    echo "$threads,$PROBLEM_SIZE,$OMP_TOTAL,$OMP_INIT,$OMP_COMP,$OMP_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE" >> "$OMP_CSV"
+done
+
+# Unset variables to avoid interfering with other tests (good practice)
+#unset OMP_PLACES
+#unset OMP_PROC_BIND
+#unset OMP_NUM_THREADS
+
+echo "---------------------------------------------------"
+echo "Benchmarking PARALLEL version (MPI Only)"
+echo "---------------------------------------------------"
+
+for mpi in "${MPI_LIST_PURE[@]}"; do
+    # Scale side length by sqrt(total_cores) to keep area proportional
+    NEW_SIDE=$(echo "sqrt($mpi) * $BASE_SIDE_LEN" | bc -l)
+    X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+    Y_SIZE=$X_SIZE
+    PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+    echo "Testing MPI with $mpi tasks (no OpenMP) on a $PROBLEM_SIZE grid..."
+
+    # MODIFIED: Bind MPI tasks to cores
+    MPI_OUTPUT=$(srun -n "$mpi" --cpu-bind=cores ./stencil_parallel_nomp -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+    MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+    MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+    MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+    MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+    MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+    MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+    MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+    MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+    MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+    LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+    LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+    COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+    MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+    MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+    MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+    MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+
+    if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+        echo "Error: the MPI run with $mpi task(s) did not produce valid times." >&2
+        echo "$MPI_OUTPUT"
+        continue
+    fi
+
+    # If it's the first run (1 task), capture the baseline time
+    if [ "$mpi" -eq 1 ]; then
+        MPI_SERIAL_TIME=$MPI_TOTAL
+        echo "Baseline time for MPI (1 task): $MPI_SERIAL_TIME s"
+    fi
+
+    # Weak scaling efficiency = Time(1 core) / Time(N cores)
+    EFFICIENCY=$(echo "scale=4; $MPI_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+    echo "Tasks: $mpi"
+    echo "  Init:      $MPI_INIT s"
+    echo "  Compute:   $MPI_COMP s ($MPI_COMP_RATIO %)"
+    echo "  Comm:      $MPI_COMM s ($MPI_COMM_RATIO %)"
+    echo "  Wait:      $MPI_WAIT s"
+    echo "  Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A} %)"
+    echo "  Total:     $MPI_TOTAL s"
+    echo "Max values across ranks:"
+    echo "  Max Total:   $MPI_MAX_TOTAL s"
+    echo "  Max Compute: $MPI_MAX_COMP s"
+    echo "  Max Comm:    $MPI_MAX_COMM s"
+    echo "  Max Wait:    $MPI_MAX_WAIT s"
+    echo "Parallel (MPI) performance:"
+    echo "  Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc) %"
+    echo "  Load imbalance: $LOAD_IMBALANCE"
+    echo "  Load Balance Efficiency: $LOAD_BALANCE_EFF"
+    echo "  Communication Efficiency: $COMM_EFFICIENCY"
+    echo "---------------------------------------------------"
+
+    echo "$mpi,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_PURE_CSV"
+done
+
+echo "---------------------------------------------------"
+echo "Benchmarking PARALLEL version (MPI + OpenMP)"
+echo "---------------------------------------------------"
+
+HYBRID_SERIAL_TIME="" # Initialize baseline time for this block
+
+for mpi in "${MPI_LIST[@]}"; do
+    TOTAL_CORES=$((mpi * OMP_THREADS_PER_TASK))
+    # Scale side length by sqrt(total_cores) to keep area proportional
+    NEW_SIDE=$(echo "sqrt($TOTAL_CORES) * $BASE_SIDE_LEN" | bc -l)
+    X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+    Y_SIZE=$X_SIZE
+    PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+    echo "Testing MPI with $mpi tasks ($TOTAL_CORES total cores) on a $PROBLEM_SIZE grid..."
+
+    # MODIFIED: Conditional binding strategy
+    # For 1-4 tasks, confine to a single socket. For more, distribute across the node.
+    #if [[ "$mpi" -le 4 ]]; then
+    #    echo "  (Binding: Confining to a single socket)"
+    #    MPI_OUTPUT=$(srun -n "$mpi" --sockets-per-node=1 --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+    #else
+    #    echo "  (Binding: Distributing across all sockets)"
+    #    MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+    #fi
+    MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom  ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+    MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+    MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+    MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+    MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+    MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+    MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+    MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+    MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+    MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+    LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+    LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+    COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+    MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+    MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+    MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+    MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+    if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+        echo "Error: the MPI run with $mpi task(s) did not produce valid times." >&2
+        echo "$MPI_OUTPUT"
+        continue
+    fi
+
+    # If it's the first run (1 task), capture the baseline time
+    if [ "$mpi" -eq 1 ]; then
+        HYBRID_SERIAL_TIME=$MPI_TOTAL
+        echo "Baseline time for MPI (1 task): $HYBRID_SERIAL_TIME s"
+    fi
+
+    # Weak scaling efficiency = Time(1 core) / Time(N cores)
+    EFFICIENCY=$(echo "scale=4; $HYBRID_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+    echo "Tasks: $mpi"
+    echo "  Init:      $MPI_INIT s"
+    echo "  Compute:   $MPI_COMP s ($MPI_COMP_RATIO %)"
+    echo "  Comm:      $MPI_COMM s ($MPI_COMM_RATIO %)"
+    echo "  Wait:      $MPI_WAIT s"
+    echo "  Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A} %)"
+    echo "  Total:     $MPI_TOTAL s"
+    echo "Max values across ranks:"
+    echo "  Max Total:   $MPI_MAX_TOTAL s"
+    echo "  Max Compute: $MPI_MAX_COMP s"
+    echo "  Max Comm:    $MPI_MAX_COMM s"
+    echo "  Max Wait:    $MPI_MAX_WAIT s"
+    echo "Parallel (MPI) performance:"
+    echo "  Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc) %"
+    echo "  Load imbalance: $LOAD_IMBALANCE"
+    echo "  Load Balance Efficiency: $LOAD_BALANCE_EFF"
+    echo "  Communication Efficiency: $COMM_EFFICIENCY"
+    echo "---------------------------------------------------"
+    
+    echo "$mpi,$OMP_THREADS_PER_TASK,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_HYBRID_CSV"
+done
+
+echo "---------------------------------------------------"
+echo "Benchmarking PARALLEL version (MPI + OpenMP - V2)"
+echo "---------------------------------------------------"
+
+HYBRID_V2_SERIAL_TIME="" # Initialize baseline time for this block
+
+for mpi in "${MPI_LIST[@]}"; do
+    TOTAL_CORES=$((mpi * OMP_THREADS_PER_TASK))
+    # Scale side length by sqrt(total_cores) to keep area proportional
+    NEW_SIDE=$(echo "sqrt($TOTAL_CORES) * $BASE_SIDE_LEN" | bc -l)
+    X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+    Y_SIZE=$X_SIZE
+    PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+    echo "Testing MPI with $mpi tasks ($TOTAL_CORES total cores) on a $PROBLEM_SIZE grid... (V2)"
+
+    # MODIFIED: Conditional binding strategy
+    # For 1-4 tasks, confine to a single socket. For more, distribute across the node.
+    #if [[ "$mpi" -le 4 ]]; then
+    #    echo "  (Binding: Confining to a single socket)"
+    #    MPI_OUTPUT=$(srun -n "$mpi" --sockets-per-node=1 --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+    #else
+    #    echo "  (Binding: Distributing across all sockets)"
+    #    MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+    #fi
+    MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK --cpu-bind=ldom ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+    MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+    MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+    MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+    MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+    MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+    MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+    MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+    MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+    MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+    LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+    LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+    COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+    MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+    MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+    MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+    MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+    if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+        echo "Error: the MPI run with $mpi task(s) did not produce valid times." >&2
+        echo "$MPI_OUTPUT"
+        continue
+    fi
+
+    # If it's the first run (1 task), capture the baseline time
+    if [ "$mpi" -eq 1 ]; then
+        HYBRID_V2_SERIAL_TIME=$MPI_TOTAL
+        echo "Baseline time for MPI (1 task): $HYBRID_V2_SERIAL_TIME s"
+    fi
+
+    # Weak scaling efficiency = Time(1 core) / Time(N cores)
+    EFFICIENCY=$(echo "scale=4; $HYBRID_V2_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+    echo "Tasks: $mpi"
+    echo "  Init:      $MPI_INIT s"
+    echo "  Compute:   $MPI_COMP s ($MPI_COMP_RATIO %)"
+    echo "  Comm:      $MPI_COMM s ($MPI_COMM_RATIO %)"
+    echo "  Wait:      $MPI_WAIT s"
+    echo "  Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A} %)"
+    echo "  Total:     $MPI_TOTAL s"
+    echo "Max values across ranks:"
+    echo "  Max Total:   $MPI_MAX_TOTAL s"
+    echo "  Max Compute: $MPI_MAX_COMP s"
+    echo "  Max Comm:    $MPI_MAX_COMM s"
+    echo "  Max Wait:    $MPI_MAX_WAIT s"
+    echo "Parallel (MPI) performance:"
+    echo "  Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc) %"
+    echo "  Load imbalance: $LOAD_IMBALANCE"
+    echo "  Load Balance Efficiency: $LOAD_BALANCE_EFF"
+    echo "  Communication Efficiency: $COMM_EFFICIENCY"
+    echo "---------------------------------------------------"
+
+    echo "$mpi,$OMP_THREADS_PER_TASK,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_HYBRID_V2_CSV"
+done
